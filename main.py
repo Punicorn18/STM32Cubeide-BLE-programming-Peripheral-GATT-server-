@@ -1,148 +1,106 @@
-import time
-from bluepy.btle import Peripheral, UUID
-from bluepy.btle import Scanner, DefaultDelegate
+from bluepy.btle import Peripheral, Scanner, DefaultDelegate, UUID, BTLEException
 
-AUTO_CONNECT = True
-TARGET_SVC_UUID = 0x180D
-TARGET_CHARACTERISTIC_UUID = 0x2A37
+# 請視情況調整 UUID 與使用的範圍
+SERVICE_UUID = UUID(0x180D)      # 這是標準的 Device Information Service
+CHAR_UUID = UUID(0x2A37)        # 這是 Manufacturer Name String
+CCCD_UUID = UUID(0x2902)        # 標準 CCCD
 
-class NotificationDelegate(DefaultDelegate):
+class ScanDelegate(DefaultDelegate):
     def __init__(self):
-        DefaultDelegate.__init__(self)
+        super().__init__()
+
+    def handleDiscovery(self, dev, isNewDev, isNewData):
+        if isNewDev:
+            print("Discovered device", dev.addr)
+        elif isNewData:
+            print("Received new data from", dev.addr)
+
+class MyDelegate(DefaultDelegate):
+    def __init__(self, char_handle):
+        super().__init__()
+        self.char_handle = char_handle
 
     def handleNotification(self, cHandle, data):
-        print(data[1])
+        if cHandle == self.char_handle:
+            print(f"> Characteristic Value Changed: {data} (hex: {data.hex()})")
 
-def find_addr(auto_connect, target_svc_uuid):
-    '''
-    Find the BLE devices, and it will return the device MAC address
+def main():
+    scanner = Scanner().withDelegate(ScanDelegate())
+    print("Scanning for devices (10s)...")
+    devices = scanner.scan(10.0)
+    addr_list = []
+    for idx, dev in enumerate(devices):
+        print(f"{idx}: Device {dev.addr} ({dev.addrType}), RSSI={dev.rssi} dB")
+        addr_list.append(dev.addr)
+        for (adtype, desc, value) in dev.getScanData():
+            print(f"   {desc} = {value}")
+    number = input('Enter your device number: ')
+    num = int(number)
+    device_mac = addr_list[num]
+    print(f"Connecting to {device_mac} ...")
 
-    if [auto_connect] set, it will find the BLE device which provide the [target_svc_uuid]
-    service and return its device directly.
+    dev = None
+    try:
+        dev = Peripheral(device_mac, 'random')  # 假設 BLE Tool 使用 random address
+        print("Connected.")
 
-    Otherwise, it will show all BLE device and the user should enter the numberto choose.
-    '''
-    target_svc_uuid_str = hex(target_svc_uuid)[2:]
+        svc = dev.getServiceByUUID(SERVICE_UUID)
+        ch = None
+        for characteristic in svc.getCharacteristics():
+            print(f"Characteristic UUID: {characteristic.uuid}")
+            if characteristic.uuid == CHAR_UUID:
+                ch = characteristic
+        if not ch:
+            print("Characteristic not found.")
+            return
+        
+        dev.withDelegate(MyDelegate(ch.getHandle()))
 
-    scanner = Scanner()
-    devices = scanner.scan(5.0)
+        descriptors = ch.getDescriptors(forUUID=CCCD_UUID)
+        if not descriptors:
+            print("CCCD not found.")
+            return
+        cccd = descriptors[0]
 
-    addr = ""
+        cccd_val = cccd.read()
+        print(f"Current CCCD: 0x{cccd_val.hex()} (int: {int.from_bytes(cccd_val, 'little')})")
 
-    if not auto_connect:
-        '''
-        It will show all BLE devices.
-        The user should input the number to choose BLE MAC
-        '''
-        addrs = []
-        num = 0
-        for dev in devices:
-            addrs.append(dev.addr)
-            print("="*20)
-            print(num)
-            print(f"Device {dev.addr}({dev.addrType}), RSSI={dev.rssi} dB")
-            for (adtype, desc, value) in dev.getScanData():
-                print(f"{desc} = {value}")
-                if target_svc_uuid_str in value:
-                    print('*'*50)
-            addr = dev.addr
-            print("="*20)
-            num += 1
-        num = input("Number:")
-        num = int(num)
-        addr = addrs[num]
-
-    else:
-        '''
-        It will choose the BLE device which contain 0x180D service
-        Directly return its BLE MAC adderess
-        '''
-        for dev in devices:
-            show = False
-            for (adtype, desc, value) in dev.getScanData():
-                if target_svc_uuid_str in value:
-                    show = True
-
-            if show:
-                print("="*20)
-                print(f"Device {dev.addr}({dev.addrType}), RSSI={dev.rssi} dB")
-                for (adtype, desc, value) in dev.getScanData():
-                    print(f"{desc} = {value}")
-                addr = dev.addr
-                print("="*20)
-                break
-
-    return addr
-
-def controlCCCDNotification(ch, switch_on):
-    '''
-    if switch_on is true, it will set CCCD to enable notification, vice versa.
-    '''
-    if switch_on:
-        target = b"\x01\x00"
-    else:
-        target = b"\x00\x00"
-
-    cccd = ch.getDescriptors(forUUID=0x2902)
-
-    if len(cccd) == 0:
-        print("No CCCD descriptor")
-    else:
-        print("================ Change CCCD value =========================")
-        print("CCCD: ", cccd[0])
-
-        value = cccd[0].read()
-        print("CCCD original value:", value)
-
-        print(f"Write", target, 'to CCCD')
-        cccd[0].write(target)
-        time.sleep(0.5)
-
-        print('CCCD new value:', cccd[0].read())
-        print("============================================================")
-
-
-
-if __name__ == '__main__':
-    '''
-    Find the BLE device(GATT Server) which provide Heart Rate Service.
-    Connect it and set CCCD value to 0x01 to open the notification.
-    After receiving about 10 data then set CCCD value to disable notifications
-    It will resuming receiving(set CCCD to 0x01 again) data after 5 seconds.
-
-    This experiment can proof that our Raspberry Pi 3(GATT Client) can modify
-    CCCD values.
-
-    '''
-    
-    addr = find_addr(AUTO_CONNECT, TARGET_SVC_UUID)
-    print(f"addr:{addr}.")
-
-    if addr != "":
-        dev = Peripheral(addr, 'random')
-        dev.setDelegate(NotificationDelegate())
-
-        svc = dev.getServiceByUUID(UUID(TARGET_SVC_UUID))
-        print ("Service: ", str(svc), svc.uuid)
-
-        for ch in svc.getCharacteristics():
-            print(ch, ch.uuid)
-
-        ch = svc.getCharacteristics(forUUID=TARGET_CHARACTERISTIC_UUID)[0]
-        controlCCCDNotification(ch, True)
-
-        counter = 0
+        # 讓user輸入CCCD設定
         while True:
-            if counter == 10:
-                controlCCCDNotification(ch, False)
-            elif counter == 15:
-                controlCCCDNotification(ch, True)
-            counter += 1
-
-            if dev.waitForNotifications(1.0):
+            cccd_choice = int(input("請輸入要寫入的CCCD值（0=關閉, 1=Notification, 2=Indication）："))
+            if cccd_choice == 0:
+                write_val = b'\x00\x00'
+            elif cccd_choice == 1:
+                write_val = b'\x01\x00'
+            elif cccd_choice == 2:
+                write_val = b'\x02\x00'
+            else:
                 continue
 
-        dev.disconnect()
-        time.sleep(1)
-    else:
-        print("Not found")
+            cccd.write(write_val, withResponse=True)
+            print(f"Written {write_val.hex()} to CCCD.")
+
+            cccd_val_after = cccd.read()
+            print(f"CCCD after write: 0x{cccd_val_after.hex()} (int: {int.from_bytes(cccd_val_after, 'little')})")
+
+            if cccd_choice in (1, 2):
+                print("等待 server 傳送變動資料（按 Ctrl+C 結束）...")
+                try:
+                    while True:
+                        if dev.waitForNotifications(5.0): # 最多等待5秒，期間有收到就自動回呼 handleNotification
+                            continue
+                        print(".", end="", flush=True)
+                except KeyboardInterrupt:
+                    print("\n結束監聽 notifications/indications。")
+                break
+
+
+    except BTLEException as e:
+        print(f"Bluetooth error: {e}")
+    finally:
+        if dev:
+            dev.disconnect()
+            print("Disconnected.")
+
+if __name__ == '__main__':
+    main()
